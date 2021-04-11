@@ -1,0 +1,427 @@
+<?php
+/*   Copyright (C) 2011 Alexis José Turruella Sánchez
+Desarrollado en el mes de octubre de 2011
+Correo electrónico: alexturruella@gmail.com
+Módulo para la gestión del precios del producto en correspondencia al volumen
+Fichero interface_modPrecioVolumen.class.php
+ */
+class InterfacePrecio
+{
+    public $db;
+    /**
+     *   \brief      Constructeur.
+     *   \param      DB      Handler d'acces base
+     */
+    public function InterfacePrecio($DB)
+    {
+        $this->db = $DB;
+
+        $this->name = preg_replace('/^Interface/i', '', get_class($this));
+        $this->family = "pvplus";
+        $this->description = "Triggers para modificar el descuento del producto dada la cantidad a vender, se obtiene de precio por volumen.";
+        $this->version = 'dolibarr'; // 'experimental' or 'dolibarr' or version
+    }
+    /**
+     *   \brief      Renvoi nom du lot de triggers
+     *   \return     string      Nom du lot de triggers
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+    /**
+     *   \brief      Renvoi descriptif du lot de triggers
+     *   \return     string      Descriptif du lot de triggers
+     */
+    public function getDesc()
+    {
+        return $this->description;
+    }
+    /**
+     *   \brief      Renvoi version du lot de triggers
+     *   \return     string      Version du lot de triggers
+     */
+    public function getVersion()
+    {
+        global $langs;
+        $langs->load("admin");
+
+        if ($this->version == 'experimental') {
+            return $langs->trans("Experimental");
+        } elseif ($this->version == 'dolibarr') {
+            return DOL_VERSION;
+        } elseif ($this->version) {
+            return $this->version;
+        } else {
+            return $langs->trans("Unknown");
+        }
+
+    }
+    /**
+     *      \brief      Fonction appelee lors du declenchement d'un evenement Dolibarr.
+     *                  D'autres fonctions run_trigger peuvent etre presentes dans includes/triggers
+     *      \param      action      Code de l'evenement
+     *      \param      object      Objet concerne
+     *      \param      user        Objet user
+     *      \param      lang        Objet lang
+     *      \param      conf        Objet conf
+     *      \return     int         <0 si ko, 0 si aucune action faite, >0 si ok
+     */
+    public function run_trigger($action, $object, $user, $langs, $conf)
+    {
+        // var_dump($object);
+        // exit;
+        if ($object->fk_product > 0) {
+            if (!$conf->pvplus->enabled) {
+                return 0;
+            } elseif ($action == 'LINEBILL_INSERT') {
+
+                dol_syslog("Trigger '" . $this->name . "' for action '$action' launched by " . __FILE__ . ". id=" . $object->id);
+
+                include_once DOL_DOCUMENT_ROOT . '/core/lib/price.lib.php';
+
+                dol_include_once('/pvplus/class/preciovolumen.class.php');
+
+
+
+                $factura = new Facture($this->db);
+                $factura->fetch($object->fk_facture);
+
+                $PRV = new Precio_Volumen($this->db);
+                $nuevo_descuento = $PRV->Obtener_Precio_Cantidad($factura->socid, $object->fk_product, $object->qty);
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad2($factura->socid, $object->qty);
+                }
+
+                if ($nuevo_descuento == false) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad1($object->fk_product, $object->qty);
+                }
+
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad3($object->fk_product, $object->qty);
+                }
+
+                if (!$nuevo_descuento == false) {
+                    $product = new Product($this->db);
+                    $product->fetch($object->fk_product);
+                    $societe = new Societe($this->db);
+                    $societe->fetch($factura->socid);
+                    $precio = 0;
+                    $precio_level_cliente = $societe->price_level;
+
+                    if ($product->price_base_type == 'TTC') {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices_ttc[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price_ttc);
+                        }
+
+                    } else {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price);
+                        }
+
+                    }
+                    //------------------------------------
+                    if ($nuevo_descuento['tipo'] == 'descuento') {
+                        $precio = price2num($precio);
+                        $descuento = price2num($nuevo_descuento['descuento']);
+                        $costonormal = ($precio * $descuento) / 100;
+                        $nuevo_precio = $precio - $costonormal;
+                    } else {
+                        $nuevo_precio = $nuevo_descuento['descuento'];
+                    }
+
+                    $pu = price2num($nuevo_precio);
+                    //------------------------------------
+
+                    $price_base_type = 'HT';
+
+                    $tabprice = calcul_price_total($object->qty, $pu, ($object->remise_percent), $object->tva_tx, $object->localtax1_tx, $object->localtax2, 0, $price_base_type, $object->info_bits, ($product->isproduct() ? 0 : 1));
+
+                    $total_ht = $tabprice[0];
+                    $total_tva = $tabprice[1];
+                    $total_ttc = $tabprice[2];
+                    $total_localtax1 = $tabprice[9];
+                    $total_localtax2 = $tabprice[10];
+                    $pu_ht = $tabprice[3];
+                    $pu_tva = $tabprice[4];
+                    $pu_ttc = $tabprice[5];
+
+                    $price = $pu;
+                    $remise = 0;
+                    $remise_percent = $object->remise_percent;
+                    if ($remise_percent > 0) {
+                        $remise = round(($pu * $remise_percent / 100), 2);
+                        $price = ($pu - $remise);
+                    } else {
+                        //calcular el porcentaje de descuento para las facturas fiscales
+                        $descuento = ($total_ht * 100 / $object->total_ht) - 100;
+                        $descuento = round(abs($descuento),2);
+                    }
+
+                    $price = price2num($price);
+
+                    $object->tva_tx = $object->tva_tx;
+                    if ($remise_percent != 0) {
+                        $object->remise_percent = $remise_percent;
+                    } else {
+                        $object->remise_percent = $descuento;
+                    }
+                    //$object->subprice = ($factura->type == 2 ? -1 : 1) * abs($pu);
+
+                    $object->total_ht = ($factura->type == 2 ? -1 : 1) * abs($total_ht);
+                    $object->total_tva = ($factura->type == 2 ? -1 : 1) * abs($total_tva);
+                    $object->total_localtax1 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax1);
+                    $object->total_localtax2 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax2);
+                    $object->total_ttc = ($factura->type == 2 ? -1 : 1) * abs($total_ttc);
+
+                    // A ne plus utiliser
+                    //$object->price = $price;
+                    $object->remise = $remise;
+
+                    $resultado = $object->update();
+                    if ($resultado > 0) {
+                        $factura->update_price();
+
+                    }
+
+                }
+            } elseif ($action == 'LINEORDER_INSERT') {
+                dol_syslog("Trigger '" . $this->name . "' for action '$action' launched by " . __FILE__ . ". id=" . $object->id);
+                include_once DOL_DOCUMENT_ROOT . '/core/lib/price.lib.php';
+
+                dol_include_once('/pvplus/class/preciovolumen.class.php');
+
+
+
+                $factura = new Commande($this->db);
+                $factura->fetch($object->fk_commande);
+
+                $PRV = new Precio_Volumen($this->db);
+                $nuevo_descuento = $PRV->Obtener_Precio_Cantidad($factura->socid, $object->fk_product, $object->qty);
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad2($factura->socid, $object->qty);
+                }
+
+                if ($nuevo_descuento == false) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad1($object->fk_product, $object->qty);
+                }
+
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad3($object->fk_product, $object->qty);
+                }
+
+                if (!$nuevo_descuento == false) {
+                    $product = new Product($this->db);
+                    $product->fetch($object->fk_product);
+                    $societe = new Societe($this->db);
+                    $societe->fetch($factura->socid);
+                    $precio = 0;
+                    $precio_level_cliente = $societe->price_level;
+
+                    if ($product->price_base_type == 'TTC') {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices_ttc[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price_ttc);
+                        }
+
+                    } else {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price);
+                        }
+
+                    }
+                    //------------------------------------
+                    if ($nuevo_descuento['tipo'] == 'descuento') {
+                        $precio = price2num($precio);
+                        $descuento = price2num($nuevo_descuento['descuento']);
+                        $costonormal = ($precio * $descuento) / 100;
+                        $nuevo_precio = $precio - $costonormal;
+                    } else {
+                        $nuevo_precio = $nuevo_descuento['descuento'];
+                    }
+
+                    $pu = price2num($nuevo_precio);
+                    //------------------------------------
+
+                    $price_base_type = 'HT';
+
+                    $tabprice = calcul_price_total($object->qty, $pu, ($object->remise_percent), $object->tva_tx, $object->localtax1_tx, $object->localtax2, 0, $price_base_type, $object->info_bits, ($product->isproduct() ? 0 : 1));
+
+                    $total_ht = $tabprice[0];
+                    $total_tva = $tabprice[1];
+                    $total_ttc = $tabprice[2];
+                    $total_localtax1 = $tabprice[9];
+                    $total_localtax2 = $tabprice[10];
+                    $pu_ht = $tabprice[3];
+                    $pu_tva = $tabprice[4];
+                    $pu_ttc = $tabprice[5];
+
+                    $price = $pu;
+                    $remise = 0;
+                    $remise_percent = $object->remise;
+                    if ($remise_percent > 0) {
+                        $remise = round(($pu * $remise_percent / 100), 2);
+                        $price = ($pu - $remise);
+                    }else {
+                        //calcular el porcentaje de descuento para las facturas fiscales
+                        $descuento = ($total_ht * 100 / $object->total_ht) - 100;
+                        $descuento = round(abs($descuento),2);
+                    }
+
+                    $price = price2num($price);
+
+                    $object->tva_tx = $object->tva_tx;
+                    if ($remise_percent != 0) {
+                        $object->remise_percent = $remise_percent;
+                    } else {
+                        $object->remise_percent = $descuento;
+                    }
+                    // $object->subprice = ($factura->type == 2 ? -1 : 1) * abs($pu);
+
+                    $object->total_ht = ($factura->type == 2 ? -1 : 1) * abs($total_ht);
+                    $object->total_tva = ($factura->type == 2 ? -1 : 1) * abs($total_tva);
+                    $object->total_localtax1 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax1);
+                    $object->total_localtax2 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax2);
+                    $object->total_ttc = ($factura->type == 2 ? -1 : 1) * abs($total_ttc);
+
+                    // A ne plus utiliser
+                    $object->price = $price;
+                    $object->remise = $remise;
+                    $resultado = $object->update();
+                    if ($resultado > 0) {
+                        $factura->update_price();
+                    }
+
+                }
+            } elseif ($action == 'LINEPROPAL_INSERT') {
+                dol_syslog("Trigger '" . $this->name . "' for action '$action' launched by " . __FILE__ . ". id=" . $object->id);
+                include_once DOL_DOCUMENT_ROOT . '/core/lib/price.lib.php';
+
+                dol_include_once('/pvplus/class/preciovolumen.class.php');
+
+
+
+                require_once DOL_DOCUMENT_ROOT . "/product/class/product.class.php";
+
+                $factura = new Propal($this->db);
+
+                $factura->fetch($object->fk_propal);
+
+                $PRV = new Precio_Volumen($this->db);
+                $nuevo_descuento = $PRV->Obtener_Precio_Cantidad($factura->socid, $object->fk_product, $object->qty);
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad2($factura->socid, $object->qty);
+                }
+
+                if ($nuevo_descuento == false) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad1($object->fk_product, $object->qty);
+                }
+
+                if ($nuevo_descuento == false && $conf->categorie->enabled) {
+                    $nuevo_descuento = $PRV->Obtener_Precio_Cantidad3($object->fk_product, $object->qty);
+                }
+
+                if (!$nuevo_descuento == false) {
+                    $product = new Product($this->db);
+                    $product->fetch($object->fk_product);
+                    $societe = new Societe($this->db);
+                    $societe->fetch($factura->socid);
+                    $precio = 0;
+                    $precio_level_cliente = $societe->price_level;
+
+                    if ($product->price_base_type == 'TTC') {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices_ttc[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price_ttc);
+                        }
+
+                    } else {
+                        if (isset($precio_level_cliente) && $conf->global->PRODUIT_MULTIPRICES) {
+                            $precio = $product->multiprices[$precio_level_cliente];
+                            $precio = price($precio);
+                        } else {
+                            $precio = price($product->price);
+                        }
+
+                    }
+                    //------------------------------------
+                    if ($nuevo_descuento['tipo'] == 'descuento') {
+                        $precio = price2num($precio);
+                        $descuento = price2num($nuevo_descuento['descuento']);
+                        $costonormal = ($precio * $descuento) / 100;
+                        $nuevo_precio = $precio - $costonormal;
+                    } else {
+                        $nuevo_precio = $nuevo_descuento['descuento'];
+                    }
+
+                    $pu = price2num($nuevo_precio);
+                    //------------------------------------
+
+                    $price_base_type = 'HT';
+
+                    $tabprice = calcul_price_total($object->qty, $pu, ($object->remise_percent), $object->tva_tx, $object->localtax1_tx, $object->localtax2, 0, $price_base_type, $object->info_bits, ($product->isproduct() ? 0 : 1));
+
+                    $total_ht = $tabprice[0];
+                    $total_tva = $tabprice[1];
+                    $total_ttc = $tabprice[2];
+                    $total_localtax1 = $tabprice[9];
+                    $total_localtax2 = $tabprice[10];
+                    $pu_ht = $tabprice[3];
+                    $pu_tva = $tabprice[4];
+                    $pu_ttc = $tabprice[5];
+
+                    $price = $pu;
+                    $remise = 0;
+                    $remise_percent = $object->remise;
+                    if ($remise_percent > 0) {
+                        $remise = round(($pu * $remise_percent / 100), 2);
+                        $price = ($pu - $remise);
+                    }else {
+                        //calcular el porcentaje de descuento para las facturas fiscales
+                        $descuento = ($total_ht * 100 / $object->total_ht) - 100;
+                        $descuento = round(abs($descuento),2);
+                    }
+
+                    $price = price2num($price);
+
+                    $object->tva_tx = $object->tva_tx;
+                    if ($remise_percent != 0) {
+                        $object->remise_percent = $remise_percent;
+                    } else {
+                        $object->remise_percent = $descuento;
+                    }
+                    // $object->subprice = ($factura->type == 2 ? -1 : 1) * abs($pu);
+
+                    $object->total_ht = ($factura->type == 2 ? -1 : 1) * abs($total_ht);
+                    $object->total_tva = ($factura->type == 2 ? -1 : 1) * abs($total_tva);
+                    $object->total_localtax1 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax1);
+                    $object->total_localtax2 = ($factura->type == 2 ? -1 : 1) * abs($total_localtax2);
+                    $object->total_ttc = ($factura->type == 2 ? -1 : 1) * abs($total_ttc);
+
+                    // A ne plus utiliser
+                    $object->price = $price;
+                    $object->remise = $remise;
+                    $resultado = $object->update();
+                    if ($resultado > 0) {
+                        $factura->update_price();
+                    }
+
+                }
+            }
+        }
+        return 0;
+    }
+}
